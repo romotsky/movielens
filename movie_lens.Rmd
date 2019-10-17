@@ -1,0 +1,602 @@
+---
+title: "MovieLens Recommendation Model"
+author: "Daniel Romotsky"
+date: "10/15/2019"
+output: pdf_document
+---
+
+```{r setup, include=TRUE, echo=FALSE, message=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=8, echo = FALSE, message=FALSE,  warning=FALSE)
+# install tinytex::install_tinytex()
+library(tinytex)
+# installed to /Users/danielromotsky/Library/Application Support/PhantomJS
+library(knitr)
+library(kableExtra) # for formatting
+library(tidyverse)
+library(caret)
+library(data.table)
+```
+
+## 1. The Project
+
+The objective of this project is to build a model that predicts a rating for a given movie for a given user.  I am using a public data set from [grouplens.org](https://grouplens.org/datasets/movielens/10m/), which includes 10 million ratings of over 10 thousand movies from over 72 thousand users. 
+
+The key steps I've taken in this project is to:  
+- Download the full data set.  
+- Data cleansing into one table.  
+- Split table into a training (90%) and test (10%) set.  
+- Apply data wrangling techniques to add new variables.  
+- Preprocessing and data visualization.  
+- Test different modeling techniques, using the Root Mean Square Error as the measure of success.  
+
+#### Root Mean Square Error (AKA **RMSE**) will be the measure of accuracy of the model.
+The calculation used here is
+$\sqrt(1/n\sum_{1}^{n} (trueratings_{n} - predictedratings_{n})^2)$
+
+#### Download the data set
+First, I need to download the data set from the grouplens site... _Please refer to the R script for these steps._
+```{r dldata, cache=TRUE, echo=FALSE, eval = FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+
+```{r pulldata, echo=FALSE}
+movielens <- read.table("/Users/danielromotsky/movielens.tsv", header=TRUE)
+```
+A view into the original data set:
+```{r checkdata, echo=FALSE}
+glimpse(movielens)
+
+#UNIQUES
+movielens %>% summarise(unique_mov = length(unique(movieId)), unique_users = length(unique(userId)), unique_genres = length(unique(genres))) %>% slice(1) %>% kable()
+```
+
+#### Create Train vs Test Groups
+Next, we split the data set into a training (90%) and test (10%) set using the caret package:
+```{r split, message=FALSE, eval=TRUE}
+# Validation set will be 10% of MovieLens data
+library(caret)
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>%
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Adding rows removed from validation set back into edx set
+removed <- anti_join(temp, validation, by = c("userId", "movieId", "rating", "timestamp", "title", "genres"))
+edx <- rbind(edx, removed)
+
+# rm(dl, ratings, movies, test_index, temp, removed)
+```
+Training set
+```{r edx, eval=TRUE, echo=FALSE}
+library(tidyverse)
+glimpse(edx)
+```
+Test set
+```{r val, eval=TRUE, echo=FALSE}
+library(tidyverse)
+glimpse(validation)
+library(scales)
+data.frame(group = c("train", "test"),
+           value = c(length(edx[,1]), length(validation[,1]))) %>%
+          ggplot(aes(x="", y=value, fill=group)) + geom_bar(width = 1, stat = "identity") + geom_text(aes(label=percent(value/(length(edx[,1]) + length(validation[,1])))), vjust=3, position = position_stack()) + theme(aspect.ratio = 5) + scale_y_continuous(labels = comma) +
+    theme(axis.text.x=element_blank(), axis.title.x = element_blank()) + ggtitle("Breakout of Groups")
+
+```
+
+Now we're ready to start building the model.  I will be using solely the *edx* data set for training purposes and testing my model on the *validation* set.
+
+## 2. *Methods & Analysis*
+
+My approach to finding an acceptable final model was to increment different effects based on the variables provided.  The first approach was to use the overall average for all the observations in the training set.
+
+#### Overall Average
+mu <- edx %>% summarise(mean(rating)) %>% pull() # overall overage rating
+Which is:
+```{r Naive, eval=TRUE, echo=FALSE}
+mu <- edx %>% summarise(mean(rating)) %>% pull() # overall overage rating
+print(mu)
+```
+We then use mu as the predictor on the validation set and compare it to the actual rankings
+```{r mutest, echo=TRUE}
+## predict ratings using mu
+predict_mu <- validation %>% mutate(pred = mu) %>% select(rating, pred)
+predict_mu %>% summarise(RMSE(rating, pred)) ## over a whole rating off on average... not good
+```
+Over 1 full star rating off is not great so overall average is definitely not good enough.
+```{r, echo=FALSE}
+Naive <- RMSE(validation$rating, mu) # save to compare
+```
+
+#### Movie Effect
+I can assume that the movie itself is a strong predictor for rating and can calculate the effects by taking the mean of the difference in movie rank and overall average rank with:
+```{r movie, eval=TRUE, echo=TRUE, message=FALSE}
+movie_avg <- edx %>% group_by(movieId) %>% summarise(bm = mean(rating - mu))
+
+glimpse(movie_avg)
+```
+
+Now that we have movie effects for the unique 10.6k movies, we can use that to estimate ratings against the test set. We join this back into the validation set and add it to the baseline mu to get our latest predictions.  We then compare it against the true ratings to calculate RMSE.
+
+```{r movietest, eval=TRUE, echo=TRUE, message=FALSE}
+## join that back into the test data to predict ratings with movie bias
+predict_mu_bm <- validation %>% left_join(movie_avg) %>% mutate(mu = mu, pred = mu + bm) %>% pull(pred)
+RMSE(validation$rating, predict_mu_bm)
+```
+```{r save}
+Naive_plus_Movie <- RMSE(validation$rating, predict_mu_bm) #save to compare
+```
+That made a significant difference 
+```{r diff, eval=TRUE, echo=FALSE}
+cat("RMSE difference between Naive prediction and adding movie effect is", Naive_plus_Movie - Naive)
+```
+
+_But can we do better?_ 
+Which movies have the worst predictions?
+```{r mdelta, eval=TRUE, echo=FALSE, tidy=TRUE}
+library(dplyr)
+m_deltas <- cbind(validation, predict_mu_bm) %>% group_by(movieId, title) %>%  
+  summarise(avg_r = mean(rating), avg_p = mean(predict_mu_bm), delta = mean(rating-avg_p), n = n()) %>% 
+  arrange(delta) 
+
+kable(head(m_deltas, 10), digits = 2) %>%
+  kable_styling(full_width = F)
+#largest deltas have 1-2 reviews
+
+```
+
+Looks like most of these have 1-2 reviews which makes it tougher to predict.
+
+Plotting out the distribution of predictions, you can see that many have few reviews.
+
+```{r pressure, echo=FALSE}
+m_deltas %>% ggplot(aes(abs(delta), n)) + geom_point(alpha=0.25) + ggtitle("Absolute Residuals vs Number of Reviews") + 
+  annotate("text", size=8, x = 2.5, y = 1000, label = "Movies with few reviews tend to\n have worse estimates") +
+  annotate("rect", xmin = 1, xmax = 3.6, ymin = -200, ymax = 200,
+  alpha = .2, color = "red")
+```
+
+##### Regularization
+For those movies with very few reviews, I want to shrink estimates.  Starting with an arbitrary lambda, let's inspect how we can regularize our estimates. Instead of taking the standard difference or avg vs rating, we include lambda and number of reviews to normalize the data.  
+```{r lambda, eval=FALSE, echo=TRUE}
+lambda <- 6 # arbitrary lambda
+b_m = sum(rating - mu)/(n()+lambda) ## revised movie effect
+```
+If n = number of reviews is large, lamba will not change the results much.  If n is small, lamba will bring the movie effect closer to zero.
+
+``` {r reg, tidy=TRUE}
+lambda <- 6
+mu <-mean(edx$rating)
+movie_reg_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_m = sum(rating - mu)/(n()+lambda), n_i = n()) 
+```
+*How is this different from the standard average?*
+
+```{r how, echo=FALSE, message=FALSE}
+data_frame( original_est = movie_avg$bm,
+            regularized = movie_reg_avgs$b_m,
+            n = movie_reg_avgs$n_i) %>%
+  ggplot(aes(original_est, regularized, size=n, color = n)) + 
+  geom_point(shape=2, alpha=0.2) + 
+  scale_color_gradient(low = "orange", high = "purple") + ggtitle("movie adjustment for Lambda=6 vs previous estimates (w/out regularization)")
+```
+Many of the movies with small n (aka reviews) move towards zero under regularization. 
+
+Now let's look at the worst rated movies with regularization implemented:
+```{r m_reg, echo=FALSE}
+edx %>% group_by(movieId, title) %>%
+  count(movieId) %>% 
+  left_join(movie_reg_avgs, by = "movieId") %>%
+  arrange((b_m)) %>% 
+  select(movieId, title, b_m, n) %>% ungroup() %>% top_n(-10, b_m) %>% kable(digits=2) %>%
+  kable_styling(full_width = F)
+```
+Let's apply this lambda to our predictions:
+```{r mov_reg, echo=TRUE, warning=FALSE}
+predict_mu_bm_reg <- mu + validation %>% left_join(movie_reg_avgs, by="movieId") %>% pull(b_m)
+cat("RMSE with movie effect lambda=6 is",RMSE(validation$rating, predict_mu_bm_reg)) 
+```
+That's not much better than our unregularized prediction
+```{r, echo=FALSE}
+cat("Improvement of adding regularization with lambda=6 is", RMSE(validation$rating, predict_mu_bm_reg) - Naive_plus_Movie)
+```
+This is because we picked an _arbitrary lambda_.  Let's create a function that tries different lambdas to find the lambda that yields the best RMSE against the test set. _*See R code for function*_
+```{r lamb_funct, echo=FALSE}
+lambdas <- seq(0, 10, 0.1)
+
+just_the_sum <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(s = sum(rating - mu), n_i = n())
+
+
+rmses <- sapply(lambdas, function(l){
+  predicted_ratings <- validation %>% 
+    left_join(just_the_sum, by='movieId') %>% 
+    mutate(b_i = s/(n_i+l)) %>%
+    mutate(pred = mu + b_i) %>%
+    pull(pred)
+  return(RMSE(predicted_ratings, validation$rating))
+})
+qplot(lambdas, rmses) + annotate("text", x= 2.3, y=.94395, label="lambda that produces\n lowest RMSE", color="blue") +
+  annotate("segment", x=2.3, xend=2.5, y=.94394, yend=.94386, color="blue", arrow=arrow(length=unit(0.05,"npc"))) +
+  annotate("text", x= 6, y=.94398, label="Arbitrary\n lambda", color="red") +
+  annotate("segment", x=6, xend=6, y=.943972, yend=.9439, color="red", arrow=arrow(length=unit(0.05,"npc")))
+cat("Lowest Lambda from function is", lambdas[which.min(rmses)])
+```
+Now we can use the lambda with the best impact to RMSE and run predictions again.
+```{r bestlamb, echo=TRUE, message=FALSE}
+lambda <- lambdas[which.min(rmses)]
+movie_reg_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(bi = sum(rating - mu)/(n()+lambda), n_i = n()) 
+
+##now let's see if it improved accuracy
+predict_mu_bi_reg <- mu + validation %>% left_join(movie_reg_avgs) %>% pull(bi)
+RMSE(validation$rating, predict_mu_bi_reg)
+```
+
+```{r, echo=FALSE}
+cat("Improvement of adding regularization with lambda=6 is", RMSE(validation$rating, predict_mu_bi_reg) - Naive_plus_Movie)
+## small improvement, let's save it
+Naive_plus_reg_Movie <- RMSE(validation$rating, predict_mu_bi_reg)
+```
+A small improvement again, but better than the arbitrary lambda!
+
+_Note that these incremental steps will be supressed for ease of reading.  Refer to the r script for the detailed script._
+
+#### User Effect
+Next, users have their own personal bias.  We can use each individuals average ratings as a predictor.
+```{r userv}
+## add in a user predictor
+user_view <- edx %>% group_by(userId) %>% summarize(n_reviews = n(), bu = mean(rating)) 
+```
+Let's look at the distribution of users:
+
+```{r user, echo=FALSE}
+user_view %>%   
+  ggplot(aes(n_reviews)) + 
+  geom_histogram(bins = 30, color = "black") +
+  # scale_x_log10() +
+  ggtitle("Avg. Number of Reviews") + scale_x_log10() +
+  annotate("text", size=6, x= 10, y=2000, label="Most users\n have left\n many\n reviews", color="blue")
+
+cat(c("Minimum reviews left by a user = ", user_view$n_reviews[which.min(user_view$n_reviews)]), sep='')
+```
+To calculate user effect (aka bias), we take the mean of the different in movie ranking (bm) and overall average rank (mu)
+```{r bu, echo=FALSE, warning=FALSE}
+user_avg <- edx %>% left_join(movie_reg_avgs) %>%
+  group_by(userId) %>% summarise(bu = mean(rating - mu - bi))
+head(user_avg) %>% kable(digits=2)
+```
+Join that back into the test data to predict ratings with movie bias AND user bias
+```{r}
+## join that back into the test data to predict ratings with movie bias AND user bias
+predict_mu_bi_bu <- validation %>% left_join(movie_reg_avgs) %>%
+  left_join(user_avg) %>% mutate(p_mu = mu, pred = mu + bi + bu) %>% pull(pred)
+cat("RMSE with user effect and movie regularized is", RMSE(validation$rating, predict_mu_bi_bu))
+
+Naive_plus_reg_Movie_plus_User <- RMSE(validation$rating, predict_mu_bi_bu)## save it for later
+```
+That's a huge improvement from modeling just the movie effect:
+```{r, echo=TRUE}
+Naive_plus_reg_Movie_plus_User - Naive_plus_reg_Movie
+```
+
+Should we do regularization? Looking at the most off predictions...
+```{r}
+edx %>% left_join(movie_reg_avgs) %>% left_join(user_avg) %>%
+  mutate(resid = rating - (mu + bi + bu)) %>% group_by(userId) %>%
+  arrange(desc(abs(resid))) %>% summarise(resid_abs = mean(abs(resid)), n = n()) %>%
+  select(userId, resid_abs, n) %>% top_n(10, resid_abs) %>% kable(digits=2) %>%
+  kable_styling(full_width = F)
+```
+... we see that the largest mis-predictions come from users with few reviews. We will use regularization again here to improve RMSE.
+
+```{r ulamb, echo=FALSE}
+lambdas <- seq(0, 10, 0.25)
+
+just_the_sum <- edx %>% left_join(movie_reg_avgs) %>%
+  group_by(userId) %>% 
+  summarize(s = sum(rating - (mu + bi)), n_i = n())
+
+rmses <- sapply(lambdas, function(l){
+  predicted_ratings <- validation %>% 
+    left_join(just_the_sum, by='userId') %>% 
+    mutate(bu = s/(n_i+l)) %>%
+    mutate(pred = mu + bu) %>%
+    pull(pred)
+  return(RMSE(predicted_ratings, validation$rating))
+})
+qplot(lambdas, rmses) +
+  annotate("text", x= 8, y=.99425, label="Best lambda", color="blue") +
+  annotate("segment", x=8, xend=8.75, y=.9942, yend=.99395, color="blue", arrow=arrow(length=unit(0.05,"npc")))
+cat("Best lambda to minimize RMSE:", lambdas[which.min(rmses)])
+```
+Now we use the best lambda to make our latest predictions:
+```{r userf}
+#find the best lambda
+lambda <- lambdas[which.min(rmses)]
+user_reg_avgs <- edx %>% left_join(movie_reg_avgs) %>%
+  group_by(userId) %>% 
+  summarize(bu = sum(rating - (mu + bi))/(n()+lambda), n = n()) 
+
+##now let's see if it improved accuracy
+predict_mu_bi_bu2 <- validation %>% left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>% mutate(p_mu = mu, pred = mu + bi + bu) %>% pull(pred)
+RMSE(validation$rating, predict_mu_bi_bu2)
+
+Naive_plus_reg_Movie_plus_reg_User <- RMSE(validation$rating, predict_mu_bi_bu2)
+
+tibble(Naive_plus_reg_Movie_plus_User, Naive_plus_reg_Movie_plus_reg_User) %>% kable()
+
+cat("Adding Regularization to the User effect improved accuracy by", Naive_plus_reg_Movie_plus_reg_User - Naive_plus_reg_Movie_plus_User)
+```
+Again, another improvement on our estimate.
+
+#### Genre Effect
+We next add the genre of the movies into the model.  As shown earlier, there are many unique genres as movies can hve a combination of many.
+```{r, echo=FALSE}
+genre_avg <- edx %>%
+  left_join(movie_reg_avgs) %>% 
+  left_join(user_reg_avgs) %>% 
+  group_by(genres) %>% summarise(bg = mean(rating - (mu + bu + bi)), n=n()) %>%
+  arrange(desc(n))
+
+cat("Total unique genres = ", lengths(genre_avg[,1]), sep = "")
+
+head(genre_avg, 10) %>% kable() %>%   kable_styling(full_width = F)
+
+```
+
+Inputting the adjustor for genre (bg) into our prediction model, we get a slightly better RMSE:
+```{r bg, echo=FALSE}
+predict_mu_bi_bu_bg <- validation %>% left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>% left_join(genre_avg, by="genres") %>% 
+  mutate(p_mu = mu, pred = mu + bi + bu + bg) %>% pull(pred)
+RMSE(validation$rating, predict_mu_bi_bu_bg)
+## eesh, only a tiny bit better
+Naive_plus_reg_Movie_plus_reg_User_plus_Genre <- RMSE(validation$rating, predict_mu_bi_bu_bg)
+cat("Improvement to RMSE is ", Naive_plus_reg_Movie_plus_reg_User_plus_Genre - Naive_plus_reg_Movie_plus_reg_User, sep="")
+```
+That's not a great improvement.  The places where we are most off are on the genres with few reviews. 
+```{r gendiff, echo = FALSE}
+m_deltas <- cbind(validation, predict_mu_bi_bu_bg) %>% group_by(genres) %>%  
+  summarise(avg_r = mean(rating), avg_p = mean(predict_mu_bi_bu_bg), delta = mean(rating-avg_p), n = n()) %>% 
+  arrange(delta) 
+
+head(m_deltas, 10) %>% kable(digits=2) %>%   kable_styling(full_width = F)
+```
+However, instead of using regularization, we can use what we know about each individual genre.
+We break up the genres field into unique, single genres with the below code:
+```{r, echo=TRUE}
+indi_genre <- edx %>% left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs)  %>% group_by(genres) %>%  
+  summarise(n = n(), bg = mean(rating - (mu + bu + bi))) %>%
+  separate_rows(genres, sep = "\\|") %>% # separate into rows
+  group_by(genres) %>% summarise(bg = mean(bg), n=mean(n)) 
+```
+
+```{r, echo=FALSE}
+indi_genre %>% kable(digits=2) %>% kable_styling(full_width = F)
+indi_genre %>% ggplot(aes(n, bg, label = genres, color = genres)) + geom_text() + 
+  theme(legend.position = "none") + xlab("number of reviews") + ylab("residual from mean") +
+  scale_x_continuous(limits = c(-1000, 15000))
+```
+Every genre is liked except children...
+
+Next, we pipe them back together, taking the mean of each indiviual genre when combined
+```{r, echo=TRUE}
+genre_lookup <- edx %>% select(genres) %>% group_by(genres) %>% summarise(n=n()) %>% #summarized to reduce lines of data
+  mutate(g2 = genres) %>% separate_rows(genres, sep = "\\|") %>% left_join(indi_genre, by="genres") %>%
+  group_by(g2) %>% summarise(bg = mean(bg)) %>% mutate(genres = g2) %>% select(genres, bg)
+
+head(genre_lookup, 10) %>% kable(digits=3) %>% kable_styling(full_width=F)
+```
+Now let's use this blended genre effect to estimate predictions:
+```{r, echo=FALSE}
+predict_mu_bi_bu_bg_indi <- validation %>% left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>% left_join(genre_lookup) %>% 
+  mutate(p_mu = mu, pred = mu + bi + bu + bg) %>% pull(pred)
+RMSE(validation$rating, predict_mu_bi_bu_bg_indi)
+# did not improve the RMSE!
+Naive_plus_reg_Movie_plus_reg_User_plus_Genre_weighted <- RMSE(validation$rating, predict_mu_bi_bu_bg_indi)
+```
+That did not help our model! Why? When looking at boxplots for average ratings at the individual genre level, we see many outliers.  This is because the combination of genres in movies cause more randomness in reviews. 
+
+```{r boxp, echo=FALSE}
+# Why were we so off?
+genre_lookup2 <- edx %>% group_by(genres) %>% summarise(avg_r = mean(rating)) %>%
+  mutate(g2 = genres) %>% separate_rows(genres, sep = "\\|") 
+genre_lookup2 %>% ggplot(aes(genres, avg_r, fill=genres)) + geom_boxplot() + 
+  facet_wrap(~genres, scales="free") + theme(legend.position = "none") + theme(axis.text.x = element_blank()) + ggtitle("Genre Average Reviews split into individual Genres - Many Outliers")
+```
+So we're scrapping the individual weighting approach and instead will use regularization.
+
+```{r ulamb2, echo=FALSE}
+lambdas <- seq(0, 5, 0.25)
+
+just_the_sum <- edx %>% 
+  left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>%
+  group_by(genres) %>% 
+  summarize(s = sum(rating - (mu + bi + bu)), n_i = n())
+
+rmses <- sapply(lambdas, function(l){
+  predicted_ratings <- validation %>% 
+    left_join(just_the_sum, by='genres') %>% 
+    mutate(bg = s/(n_i+l)) %>%
+    mutate(pred = mu + bg) %>%
+    pull(pred)
+  return(RMSE(predicted_ratings, validation$rating))
+})
+qplot(lambdas, rmses) + #theme(axis.text.y=element_blank()) +
+  annotate("text", x = 2.5, y = 1.05924842, label = "Best lambda to reduce RMSE", color="blue") +
+  annotate("segment", x=2.5, xend=2.25, y=1.0592484, yend=1.05924822, color="blue", arrow=arrow(length=unit(0.05,"npc")))
+
+cat("Best lambda to minimize RMSE:",lambdas[which.min(rmses)])
+
+lambda <- lambdas[which.min(rmses)]
+genre_reg_avgs <- edx %>% left_join(movie_reg_avgs) %>% left_join(user_reg_avgs) %>%
+  group_by(genres) %>% 
+  summarize(bg = sum(rating - (mu + bi + bu))/(n()+lambda), n = n()) 
+
+##now let's see if it improved accuracy
+predict_mu_bi_bu_bg2 <- validation %>% left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>% left_join(genre_reg_avgs, by="genres") %>% 
+  mutate(p_mu = mu, pred = mu + bi + bu + bg) %>% pull(pred)
+cat("RMSE with Genre regularized is", RMSE(validation$rating, predict_mu_bi_bu2))
+
+Naive_plus_reg_Movie_plus_reg_User_reg_Genre <- RMSE(validation$rating, predict_mu_bi_bu2)
+
+cat("Improvement of using regularization instead of a individual weighted approach is", Naive_plus_reg_Movie_plus_reg_User_reg_Genre - Naive_plus_reg_Movie_plus_reg_User_plus_Genre_weighted)
+```
+Regularization works better for genres as well.
+
+#### Year Effects
+Lastly, we will use the year in which the movie was produced as a predictor. Some data wrangling will be necessary, as the year is stored within the movie title.
+# I will want to inspect year of movie as a predictor, so will separate
+```{r y, echo=FALSE}
+kable(edx$title[1:5], col.names = "titles") %>% kable_styling(full_width = F)
+```
+We use regex and the stringr package to extract year:
+```{r stringr, echo=TRUE, messages=FALSE}
+library(stringr)
+year_pattern <- "\\([12][0-9][0-9][0-9]\\)"
+str_detect(edx$title[1:5], year_pattern)
+str_view(as.character(edx$title[1:5]), year_pattern)
+## apply this to train and test sets and split out title name
+#  apply this to the test and train groups
+edx <- edx  %>% mutate(m_year = substr(str_extract(title, year_pattern), 2, 5), #skip the parentheses
+                       title_clean = substr(title, 1, str_locate(title, year_pattern)[,1] - 2)) # removing year from title
+validation <- validation %>% mutate(m_year = substr(str_extract(title, year_pattern), 2, 5),
+                                    title_clean = substr(title, 1, str_locate(title, year_pattern)[,1] - 2)) # removing year from title
+
+kable(edx %>% select(title, title_clean, m_year) %>% slice(1:5)) %>% kable_styling(full_width = F)
+```
+
+Now lets inspect the yearly data:
+
+```{r yeargraph, echo=FALSE}
+edx %>% group_by(m_year) %>% summarise(avg_r_year = mean(rating), n=n()) %>% 
+  ggplot(aes(x = m_year, y = avg_r_year)) + geom_point(aes(size = n))  +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6)) + scale_size_continuous(labels = comma) +
+  scale_x_discrete(breaks=seq(1915, 2000, 5)) + ggtitle("More Reviews for Newer Films")
+## lots of variability in the earlier years with less reviews made. 
+year_lookup <- edx %>% left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>% left_join(genre_avg, by="genres") %>%
+  group_by(m_year) %>% summarise(by = mean(rating - (mu + bu + bi + bg)), n=n())
+cat("Fewest reviews are in year", year_lookup$m_year[which.min(year_lookup$n)], "with only", year_lookup$n[which.min(year_lookup$n)], "reviews.")
+```
+We see lots of variability in the earlier years with less reviews made. However, regularization is not a good option here as there are ample reviews across the years. 
+
+```{r yearreg, eval = TRUE}
+lambdas <- seq(0, 30, 1)
+
+just_the_sum <- edx %>% 
+  left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>%
+  left_join(genre_avg, by="genres") %>%
+  group_by(m_year) %>% 
+  summarize(s = sum(rating - (mu + bi + bu + bg)), n_i = n())
+
+rmses <- sapply(lambdas, function(l){
+  predicted_ratings <- validation %>% 
+    left_join(just_the_sum, by='m_year') %>% 
+    mutate(by = s/(n_i+l)) %>%
+    mutate(pred = mu + by) %>%
+    pull(pred)
+  return(RMSE(predicted_ratings, validation$rating))
+})
+# qplot(lambdas, rmses) + ggtitle("Regularization does not improve RMSE")
+
+cat("Best lambda to minimize RMSE:",lambdas[which.min(rmses)])
+
+lambda <- lambdas[which.min(rmses)]
+```
+
+Regularization is not ideal for the year effect, so we will apply the yearly average as a predictor (by).
+
+```{r year, eval=TRUE}
+predict_mu_bi_bu_bg_by <- validation %>% left_join(movie_reg_avgs) %>%
+  left_join(user_reg_avgs) %>% left_join(genre_avg, by="genres") %>% 
+  left_join(year_lookup, by="m_year") %>%
+  mutate(p_mu = mu, pred = mu + bi + bu + bg + by) %>% pull(pred)
+
+cat("Prediction with year effect included yields a final RMSE of", RMSE(validation$rating, predict_mu_bi_bu_bg_by))
+# helped a tiny bit! 
+
+Naive_plus_reg_Movie_plus_reg_User_plus_Genre_Year <- RMSE(validation$rating, predict_mu_bi_bu_bg_by)
+
+
+```
+
+
+## 3. Results
+Our final model uses regularized Movie, User, and Genre effects as well as Yearly effects.  Below, you can see the comparison of the 9 different models built:
+
+```{r final, eval=TRUE}
+## final view
+
+rmse_results <- rbind(Naive
+                      ,Naive_plus_Movie
+                      ,Naive_plus_reg_Movie
+                      ,Naive_plus_reg_Movie_plus_User
+                      ,Naive_plus_reg_Movie_plus_reg_User
+                      ,Naive_plus_reg_Movie_plus_reg_User_plus_Genre
+                      ,Naive_plus_reg_Movie_plus_reg_User_plus_Genre_weighted
+                      ,Naive_plus_reg_Movie_plus_reg_User_reg_Genre
+                      ,Naive_plus_reg_Movie_plus_reg_User_plus_Genre_Year
+                      )
+rownames(rmse_results) <- c('Naive'
+                          ,"Naive_plus_Movie"
+                          ,"Naive_plus_reg_Movie"
+                          ,"Naive_plus_reg_Movie_plus_User"
+                          ,"Naive_plus_reg_Movie_plus_reg_User"
+                          ,"Naive_plus_reg_Movie_plus_reg_User_plus_Genre"
+                          ,"Naive_plus_reg_Movie_plus_reg_User_plus_Genre_weighted"
+                          ,"Naive_plus_reg_Movie_plus_reg_User_reg_Genre"
+                          ,"Naive_plus_reg_Movie_plus_reg_User_plus_Genre_Year"
+                           )
+
+colnames(rmse_results) <- "RMSE Results"
+kable(rmse_results)
+## plot
+data.frame(step = c(1:length(rmse_results)), 
+           name = row.names(rmse_results), 
+           RMSE = rmse_results[,1]) %>%
+  ggplot(aes(x=step, y=RMSE)) + geom_text(aes(label = name)) + 
+  geom_text(aes(label=round(RMSE,5), color=RMSE), vjust=2) + scale_colour_gradient(low = "dark green", high = "red") +
+  coord_flip() + geom_path(alpha=0.5, color="green", arrow=arrow(type="closed")) +  scale_x_continuous(trans="reverse") + scale_y_continuous(limits = c(0.8,1.07)) + ggtitle("Final RMSE Results")
+```
+
+## 4. Conclusion
+After incrementing new effects into the model, we found that adding regularization helped improve the Root Mean Square Error.  Unfortunately, using the weighted genre calculation was not effective as its impact was skewed due to randomness in the ratings. We also found that regularization did not improve results for effects with large numbers of records such as year.
+
+A limitation with this Recommendation Model is that new recommendations assume that there is previous data on the user and the movie.  The control group encompassed all movies and users in the test group.
+
+*Thanks for reading!*
